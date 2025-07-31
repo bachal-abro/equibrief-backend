@@ -1,15 +1,19 @@
 from fetch_data import get_news_data
-from gemini_Client import summarize_with_cohere
+from gemini_Client import summarize_with_gemini
 from twitter_client import post_to_twitter
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from apscheduler.schedulers.background import BackgroundScheduler
+import requests
 import uvicorn
 import datetime
 import logging
 from pytz import timezone
 import sys
 from fastapi.middleware.cors import CORSMiddleware
-
+import json
+import re
+from pprint import pprint
+import uuid
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +49,44 @@ latest_data = {
     "tweet": {}
 }
 
+latest_events = []
+
+def parse_dynamic_article(text):
+    article = {}
+
+    # 1. Extract title
+    title_match = re.search(r"title:\s*(.+)", text)
+    if title_match:
+        article['title'] = title_match.group(1).strip()
+
+    # 2. Extract body section
+    body_match = re.search(r"body:\s*(.*)", text, re.DOTALL)
+    if not body_match:
+        return article
+
+    body_text = body_match.group(1).strip()
+    article['body'] = {}
+
+    # 3. Detect section headers dynamically (lines ending with colon)
+    section_matches = list(re.finditer(r"^([A-Z][^\n]{3,100}):\s*$", body_text, re.MULTILINE))
+
+    # 4. Split content based on detected headers
+    for i, match in enumerate(section_matches):
+        section_title = match.group(1).strip()
+        start_index = match.end()
+        end_index = section_matches[i + 1].start() if i + 1 < len(section_matches) else len(body_text)
+        section_content = body_text[start_index:end_index].strip()
+
+        # Process Key Takeaways as list
+        if "takeaway" in section_title.lower():
+            lines = [line.strip("•- ") for line in section_content.splitlines() if line.strip()]
+            article['body'][section_title] = lines
+        else:
+            article['body'][section_title] = section_content
+
+    return article
+
+
 def initialize_scheduler():
     scheduler = BackgroundScheduler(
     timezone=tz,
@@ -55,6 +97,14 @@ def initialize_scheduler():
         trigger="interval",
         hours=4,  # 24 / 5 = 4.8 → closest integer is 4
         id="five_times_news_fetch",
+        replace_existing=True
+    
+    )
+    scheduler.add_job(
+        get_calendar,
+        trigger="interval",
+        hours=1,
+        id="get_calendar",
         replace_existing=True
     )
         # Daily tweet
@@ -113,11 +163,11 @@ def tweet(summary_type="daily"):
         newsTitles =  "\n".join(titles)
         logger.info("News data fetched successfully")
         
-        tweet_text = summarize_with_cohere("", newsTitles)
+        tweet_text = summarize_with_gemini("", newsTitles)
         logger.info(f"Generated tweet: {tweet_text[:50]}...")
         
         result = {
-            "id": 121,
+            "id": str(uuid.uuid4()),
             "text": "message",
             "url": "tweet_url",
             "timestamp": datetime.datetime.now().isoformat()
@@ -139,38 +189,40 @@ def fetch_and_store_news():
         news = get_news_data(summary_type="daily")
         desc_list = [item["description"] for item in news]
         concatenated_descriptions = "\n".join([f"[{i}] {desc}" for i, desc in enumerate(desc_list, start=1)])
-        generated_article = summarize_with_cohere("", concatenated_descriptions)
-
-        title, body = "", ""
-        if "Body" in generated_article:
-            parts = generated_article.split("Body", 1)
-            title = parts[0].replace("Title", "").replace("#", "").replace("**", "").strip()
-            if title.startswith(": "): title = title[2:]
-            body = parts[1].replace("#", "").replace("**", "").strip()
-            if body.startswith(": "): body = body[2:]
-        else:
-            title = generated_article.replace("Title", "").replace("#", "").replace("**", "").strip()
-
-        if not body:
-            logger.warning("Generated article has no body. Skipping.")
-            return
-
+        generated_article = summarize_with_gemini("", concatenated_descriptions)
+        parsed = parse_dynamic_article(generated_article)
         structured_article = {
-            "title": title,
-            "body": body,
+            "title": parsed["title"],
+            "body": parsed["body"],
             "dateTime": datetime.datetime.now(tz).isoformat(),
-            "id": len(body) + 1
+            "id": str(uuid.uuid4())
         }
-
         if len(articles) >= 5:
             articles.pop(0)  # Remove the first (oldest) article
-            
         articles.append(structured_article)  # Add the newest article
     
         latest_data["news"] = articles.copy()
         
     except Exception as e:
         logger.error(f"Error fetching hourly news: {str(e)}", exc_info=True)
+
+def get_economic_calendar():
+    try:
+        global latest_events
+        FAIRECONOMY_URL = "https://nfs.faireconomy.media/cc_calendar_thisweek.json"
+        response = requests.get(FAIRECONOMY_URL, timeout=10)
+        print("Response: ", response)
+        response.raise_for_status()
+        data = response.json()
+        usd_events = [event for event in data if event.get("country") == "USD"]
+        if len(usd_events) != 0:
+            latest_events = usd_events
+        return usd_events
+    except requests.RequestException as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 @app.get("/")
 async def manual_trigger(summary_type: str = "daily"):
@@ -192,13 +244,33 @@ async def get_latest_data():
     global latest_data
     return latest_data
 
-
 @app.get("/latest-news")
 async def get_latest_data():
     global latest_data
     news = get_news_data(summary_type="daily")
     latest_data["news"] = news
     return latest_data
+
+@app.get("/economic-calendar")
+async def get_calendar():
+    try:
+        global latest_events
+        FAIRECONOMY_URL = "https://nfs.faireconomy.media/cc_calendar_thisweek.json"
+        response = requests.get(FAIRECONOMY_URL, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        usd_events = [event for event in data if event.get("country") == "USD"]
+        if len(usd_events) != 0:
+            latest_events = usd_events
+        return {"status": "success", "events": usd_events}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/latest-events")
+async def get_latest_data():
+    global latest_events
+    return latest_events
+
 
 @app.on_event("startup")
 async def startup_event():
